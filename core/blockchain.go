@@ -45,6 +45,9 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	lru "github.com/hashicorp/golang-lru"
+
+	"github.com/ethereum/go-ethereum/mamoru"
+	statistics "github.com/ethereum/go-ethereum/mamoru/stats"
 )
 
 var (
@@ -209,6 +212,10 @@ type BlockChain struct {
 
 	shouldPreserve  func(*types.Block) bool        // Function used to determine whether should preserve the given block.
 	terminateInsert func(common.Hash, uint64) bool // Testing hook used to terminate ancient receipt chain insertion.
+
+	Sniffer *mamoru.Sniffer // Mamoru Sniffer
+	// mamoru Feeder
+	MamoruFeeder mamoru.Feeder
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -245,6 +252,9 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		futureBlocks:   futureBlocks,
 		engine:         engine,
 		vmConfig:       vmConfig,
+
+		Sniffer:      mamoru.NewSniffer(), // Mamoru Sniffer
+		MamoruFeeder: nil,
 	}
 	bc.validator = NewBlockValidator(chainConfig, bc, engine)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
@@ -1849,7 +1859,23 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 				throwaway, _ := state.New(parent.Root, bc.stateCache, bc.snaps)
 
 				go func(start time.Time, followup *types.Block, throwaway *state.StateDB, interrupt *uint32) {
-					bc.prefetcher.Prefetch(followup, throwaway, bc.vmConfig, &followupInterrupt)
+
+					//////////////////////////// Mamoru /////////////////////////////////
+					// Clear Tracer in prefecher
+					vmConfig := vm.Config{
+						Debug:                   false,
+						Tracer:                  nil,
+						NoRecursion:             bc.vmConfig.NoRecursion,
+						NoBaseFee:               bc.vmConfig.NoBaseFee,
+						EnablePreimageRecording: bc.vmConfig.EnablePreimageRecording,
+						JumpTable:               bc.vmConfig.JumpTable,
+						ExtraEips:               bc.vmConfig.ExtraEips,
+						StatePrecompiles:        bc.vmConfig.StatePrecompiles,
+					}
+					//bc.prefetcher.Prefetch(followup, throwaway, bc.vmConfig, &followupInterrupt)
+					//////////////////////////// Mamoru /////////////////////////////////
+
+					bc.prefetcher.Prefetch(followup, throwaway, vmConfig, &followupInterrupt)
 
 					blockPrefetchExecuteTimer.Update(time.Since(start))
 					if atomic.LoadUint32(interrupt) == 1 {
@@ -1858,9 +1884,63 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 				}(time.Now(), followup, throwaway, &followupInterrupt)
 			}
 		}
+
+		//////////////////////////////////////////////////////////////
+		var vmConfig vm.Config
+		if bc.Sniffer.CheckRequirements() {
+			vmConfig = bc.vmConfig
+			vmConfig.Debug = true
+			vmConfig.Tracer = mamoru.NewCallStackTracer(block.Transactions(), mamoru.RandStr(8), false, mamoru.CtxBlockchain)
+		} else {
+			vmConfig = vm.Config{
+				Debug:                   false,
+				Tracer:                  nil,
+				NoBaseFee:               bc.vmConfig.NoBaseFee,
+				EnablePreimageRecording: bc.vmConfig.EnablePreimageRecording,
+				ExtraEips:               bc.vmConfig.ExtraEips,
+			}
+		}
+		//////////////////////////////////////////////////////////////
 		// Process block using the parent state as reference point
 		substart := time.Now()
 		receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
+		////////////////////////////////////////////////////////////
+		if bc.Sniffer.CheckRequirements() && vmConfig.Tracer != nil {
+			startTime := time.Now()
+			log.Info("Mamoru Sniffer start", "number", block.NumberU64(), "ctx", mamoru.CtxBlockchain)
+
+			feeder := bc.MamoruFeeder
+			if feeder == nil {
+				feeder = mamoru.NewFeed(bc.chainConfig, statistics.NewStatsBlockchain())
+			}
+
+			tracer := mamoru.NewTracer(feeder)
+			tracer.FeedBlock(block)
+			tracer.FeedTransactions(block.Number(), block.Time(), block.Transactions(), receipts)
+			tracer.FeedEvents(receipts)
+			// Collect Call Trace data from EVM
+			if callTracer, ok := vmConfig.Tracer.(*mamoru.CallStackTracer); ok {
+				callFrames, err := callTracer.TakeResult()
+				if err != nil {
+					log.Error("Mamoru Sniffer Tracer Error", "err", err, "ctx", mamoru.CtxBlockchain)
+					//return it.index, err
+				} else {
+					var bytesLength int
+					for i := 0; i < len(callFrames); i++ {
+						bytesLength += len(callFrames[i].Input)
+					}
+
+					log.Info("Mamoru finish collected", "number", block.NumberU64(), "txs", block.Transactions().Len(),
+						"receipts", receipts.Len(), "callFrames", len(callFrames), "callFrames.input.len", bytesLength, "ctx", mamoru.CtxBlockchain)
+
+					tracer.FeedCallTraces(callFrames, block.NumberU64())
+				}
+			}
+
+			tracer.Send(startTime, block.Number(), block.Hash(), mamoru.CtxBlockchain)
+		}
+
+		////////////////////////////////////////////////////////////
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)

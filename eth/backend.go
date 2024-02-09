@@ -18,9 +18,11 @@
 package eth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -55,6 +57,10 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+
+	"github.com/ethereum/go-ethereum/mamoru"
+	"github.com/ethereum/go-ethereum/mamoru/mempool"
+	statistics "github.com/ethereum/go-ethereum/mamoru/stats"
 )
 
 // Config contains the configuration options of the ETH protocol.
@@ -205,6 +211,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 	eth.txPool = core.NewTxPool(config.TxPool, chainConfig, eth.blockchain)
 
+	////////////////////////////////////////////////////////
+	// Attach txpool sniffer
+	if os.Getenv("MAMORU_TXPOOL_ENABLE") == "true" {
+		mempool.NewSniffer(context.Background(), eth.txPool, eth.blockchain, eth.blockchain.Config(),
+			mamoru.NewFeed(eth.blockchain.Config(), statistics.NewStatsTxpool()))
+	}
+	////////////////////////////////////////////////////////
+
 	// Permit the downloader to use the trie cache allowance during fast sync
 	cacheLimit := cacheConfig.TrieCleanLimit + cacheConfig.TrieDirtyLimit + cacheConfig.SnapshotLimit
 	checkpoint := config.Checkpoint
@@ -224,7 +238,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}); err != nil {
 		return nil, err
 	}
-
+	////////////////////////////////////////////////////////
+	// Attach downloader to sniffer
+	eth.blockchain.Sniffer.SetDownloader(eth.handler.downloader)
+	////////////////////////////////////////////////////////
 	eth.miner = miner.New(eth, &config.Miner, chainConfig, eth.EventMux(), eth.engine, eth.isLocalBlock)
 	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
 
